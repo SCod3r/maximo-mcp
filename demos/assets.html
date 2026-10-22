@@ -7,7 +7,7 @@
     <title>Maximo Asset Manager</title>
     <meta name="description" content="AI-Generated Maximo Asset Management Dashboard">
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="https://unpkg.com/lucide@1.61.0/dist/umd/lucide.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {
@@ -285,6 +285,16 @@
 
         const PRELOADED_SITES = ["BEDFORD", "FLEET", "LAREDO"];
 
+        // Escape untrusted values (Maximo data) before inserting them into HTML.
+        function esc(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // Assets currently rendered in the table (looked up by row index on click).
+        let currentAssets = [];
+
         // API Configuration
         const API_BASE = '/maximo/api/os/mxasset';
         let allAssets = [];
@@ -343,20 +353,21 @@
                 return;
             }
 
+            currentAssets = assets;
             tbody.innerHTML = assets.map((asset, index) => `
-                <tr class="asset-row border-b border-slate-800/50 transition-all duration-200 cursor-pointer" data-asset='${JSON.stringify(asset)}' style="animation-delay: ${index * 0.05}s">
+                <tr class="asset-row border-b border-slate-800/50 transition-all duration-200 cursor-pointer" data-index="${index}" style="animation-delay: ${index * 0.05}s">
                     <td class="px-6 py-4">
-                        <span class="font-mono font-semibold text-blue-400">${asset.assetnum || 'N/A'}</span>
+                        <span class="font-mono font-semibold text-blue-400">${esc(asset.assetnum || 'N/A')}</span>
                     </td>
-                    <td class="px-6 py-4 text-slate-300 max-w-xs truncate">${asset.description || 'No description'}</td>
+                    <td class="px-6 py-4 text-slate-300 max-w-xs truncate">${esc(asset.description || 'No description')}</td>
                     <td class="px-6 py-4">
                         <span class="px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(asset.status)}">
-                            ${asset.status || 'Unknown'}
+                            ${esc(asset.status || 'Unknown')}
                         </span>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">${asset.location || '-'}</td>
+                    <td class="px-6 py-4 text-slate-400">${esc(asset.location || '-')}</td>
                     <td class="px-6 py-4">
-                        <span class="px-2 py-1 rounded bg-slate-800 text-slate-300 text-xs">${asset.siteid || '-'}</span>
+                        <span class="px-2 py-1 rounded bg-slate-800 text-slate-300 text-xs">${esc(asset.siteid || '-')}</span>
                     </td>
                     <td class="px-6 py-4">
                         ${asset.isrunning
@@ -391,7 +402,7 @@
         function attachRowListeners() {
             document.querySelectorAll('.asset-row').forEach(row => {
                 row.addEventListener('click', () => {
-                    const asset = JSON.parse(row.dataset.asset);
+                    const asset = currentAssets[Number(row.dataset.index)];
                     showDetail(asset);
                 });
             });
@@ -411,8 +422,8 @@
                                     <i data-lucide="box" class="w-8 h-8 text-blue-400"></i>
                                 </div>
                                 <div>
-                                    <h3 class="text-xl font-bold text-white">${asset.assetnum}</h3>
-                                    <p class="text-slate-400">${asset.description || 'No description'}</p>
+                                    <h3 class="text-xl font-bold text-white">${esc(asset.assetnum)}</h3>
+                                    <p class="text-slate-400">${esc(asset.description || 'No description')}</p>
                                 </div>
                             </div>
                         </div>
@@ -422,18 +433,18 @@
                         <div class="bg-slate-800/50 rounded-xl p-4">
                             <p class="text-sm text-slate-400 mb-1">Status</p>
                             <span class="px-3 py-1 rounded-full text-sm font-medium ${getStatusColor(asset.status)}">
-                                ${asset.status || 'Unknown'}
+                                ${esc(asset.status || 'Unknown')}
                             </span>
                         </div>
                         
                         <div class="bg-slate-800/50 rounded-xl p-4">
                             <p class="text-sm text-slate-400 mb-1">Location</p>
-                            <p class="text-white font-medium">${asset.location || 'Not specified'}</p>
+                            <p class="text-white font-medium">${esc(asset.location || 'Not specified')}</p>
                         </div>
                         
                         <div class="bg-slate-800/50 rounded-xl p-4">
                             <p class="text-sm text-slate-400 mb-1">Site</p>
-                            <p class="text-white font-medium">${asset.siteid || 'Not specified'}</p>
+                            <p class="text-white font-medium">${esc(asset.siteid || 'Not specified')}</p>
                         </div>
                         
                         <div class="bg-slate-800/50 rounded-xl p-4">
