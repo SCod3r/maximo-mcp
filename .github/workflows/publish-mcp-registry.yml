@@ -22,13 +22,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
+      # Pinned release + SHA-256 (from the release's registry_1.8.1_checksums.txt) so a
+      # compromised "latest" release cannot run in a job that can mint OIDC tokens.
       - name: Install mcp-publisher CLI
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
         run: |
-          curl -L \
-            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
-            | tar xz mcp-publisher
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum --check --strict
+          tar xzf mcp-publisher.tar.gz mcp-publisher
           sudo mv mcp-publisher /usr/local/bin/
           mcp-publisher --version
 

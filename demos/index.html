@@ -12,7 +12,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Maximo Work Orders</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/lucide@1.61.0/dist/umd/lucide.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
@@ -104,7 +104,7 @@
                 <div>
                     <p class="text-sm text-slate-400 font-medium">API Source</p>
                     <p class="text-sm font-semibold text-slate-100 truncate w-32 md:w-48"
-                        title="manage.edf-rba.ssw-demos.com">...ssw-demos.com</p>
+                        title="Maximo (via local proxy)">Local proxy</p>
                 </div>
                 <div class="bg-violet-900/30 text-violet-400 p-2 rounded-lg">
                     <i data-lucide="server" class="w-5 h-5"></i>
@@ -276,8 +276,22 @@
     </main>
 
     <script>
+        // Escape untrusted values (Maximo data, error text) before inserting them into HTML.
+        function esc(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // Convert an absolute Maximo href into a same-origin path routed through the local proxy.
+        function toProxyPath(href) {
+            if (!href) return null;
+            const u = new URL(href, window.location.origin);
+            return u.pathname + u.search;
+        }
+
         // CONFIGURATION
-        // Note: API requests go through local proxy (server.js) which handles authentication
+        // Note: API requests go through local proxy (server.js), which adds the API key server-side
         const CONFIG = {
             API_URL: "/maximo/api/os/mxwo",
             // API_KEY is handled by the proxy server from .env
@@ -307,7 +321,7 @@
 
             try {
                 // Determine URL
-                let fetchUrl = url;
+                let fetchUrl = url ? toProxyPath(url) : null;
                 if (!fetchUrl) {
                     const params = new URLSearchParams({
                         "oslc.pageSize": CONFIG.PAGE_SIZE,
@@ -322,8 +336,7 @@
                 const response = await fetch(fetchUrl, {
                     method: 'GET',
                     headers: {
-                        'apikey': CONFIG.API_KEY,
-                        'Content-Type': 'application/json'
+                        'Accept': 'application/json'
                     }
                 });
 
@@ -349,7 +362,7 @@
                     <div class="flex flex-col items-center justify-center h-full p-4 text-center text-red-500">
                         <i data-lucide="alert-circle" class="w-8 h-8 mb-2"></i>
                         <p class="text-sm font-medium">Failed to load data</p>
-                        <p class="text-xs text-slate-400 mt-1">${error.message}</p>
+                        <p class="text-xs text-slate-400 mt-1">${esc(error.message)}</p>
                         <p class="text-xs text-amber-600 mt-4 bg-amber-50 p-2 rounded border border-amber-200">
                             Note: CORS issues may prevent browser access to this API directly. 
                             Ideally, use a proxy server or disable CORS for testing.
@@ -386,8 +399,7 @@
                 const response = await fetch(fetchUrl, {
                     method: 'GET',
                     headers: {
-                        'apikey': CONFIG.API_KEY,
-                        'Content-Type': 'application/json'
+                        'Accept': 'application/json'
                     }
                 });
 
@@ -433,14 +445,14 @@
                                 <i data-lucide="file-text" class="w-5 h-5"></i>
                             </div>
                             <div class="min-w-0">
-                                <h3 class="font-bold text-slate-200 text-sm truncate">${wo.wonum}</h3>
-                                <p class="text-xs text-slate-400 truncate mb-1">${wo.description || 'No Description'}</p>
+                                <h3 class="font-bold text-slate-200 text-sm truncate">${esc(wo.wonum)}</h3>
+                                <p class="text-xs text-slate-400 truncate mb-1">${esc(wo.description || 'No Description')}</p>
                                 <div class="flex flex-wrap gap-1 text-[10px] font-mono">
-                                    <span class="bg-slate-800 text-slate-400 border border-slate-700 px-1 rounded">${wo.siteid || 'N/A'}</span>
-                                    <span class="${getStatusColor(wo.status)} px-1 rounded border">${wo.status}</span>
+                                    <span class="bg-slate-800 text-slate-400 border border-slate-700 px-1 rounded">${esc(wo.siteid || 'N/A')}</span>
+                                    <span class="${getStatusColor(wo.status)} px-1 rounded border">${esc(wo.status)}</span>
                                 </div>
                                 <p class="text-[10px] text-slate-500 mt-1 flex items-center gap-1">
-                                    <i data-lucide="calendar" class="w-3 h-3"></i> ${formatDate(wo.reportdate)}
+                                    <i data-lucide="calendar" class="w-3 h-3"></i> ${esc(formatDate(wo.reportdate))}
                                 </p>
                             </div>
                         </div>
@@ -461,13 +473,18 @@
             if (state.nextPageHref) {
                 paginationContainer.innerHTML = `
                     <span class="text-xs text-slate-500">Page ${state.page}</span>
-                    <button onclick="fetchWorkOrders('${state.nextPageHref}')" class="flex items-center gap-1 px-3 py-1.5 bg-slate-900 border border-slate-700 text-slate-300 text-xs font-medium rounded hover:bg-slate-800 transition-colors">
+                    <button id="next-page-btn" class="flex items-center gap-1 px-3 py-1.5 bg-slate-900 border border-slate-700 text-slate-300 text-xs font-medium rounded hover:bg-slate-800 transition-colors">
                         Next
                         <i data-lucide="chevron-right" class="w-3 h-3"></i>
                     </button>
                 `;
             } else {
                 paginationContainer.innerHTML = `<span class="text-xs text-slate-500 w-full text-center">End of results</span>`;
+            }
+            const nextBtn = document.getElementById('next-page-btn');
+            if (nextBtn) {
+                const nextHref = state.nextPageHref;
+                nextBtn.addEventListener('click', () => fetchWorkOrders(nextHref));
             }
 
             if (window.lucide) lucide.createIcons();
@@ -543,7 +560,7 @@
             const el = document.getElementById('connection-status');
             el.innerHTML = `
                 <span class="w-2 h-2 rounded-full ${isGood ? 'bg-green-500' : 'bg-red-500'}"></span>
-                ${text}
+                ${esc(text)}
             `;
         }
 

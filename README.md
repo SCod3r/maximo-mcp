@@ -312,7 +312,7 @@ The server exposes **9 tools** to the AI — 6 read tools and 3 write/CRUD tools
 
 ### Write Tools (CRUD)
 
-> ⚠️ **Write tools modify live data.** Use a read-only API key for exploration; only enable write access for known workflows.
+> ⚠️ **Write tools modify live data and are disabled by default.** They are only exposed when `MAXIMO_ENABLE_WRITES=true`. `run_action` only runs actions listed in `MAXIMO_ALLOWED_ACTIONS` (default: `changeStatus`). Use a read-only API key for exploration; only enable write access for known workflows.
 
 | Tool Name | Description |
 | :--- | :--- |
@@ -525,6 +525,25 @@ Maximo-MCP/
 | 🔒 **Environment Variables** | Never hardcode credentials in config files |
 | 🌐 **HTTPS Only** | Always use encrypted connections to Maximo |
 | 🧪 **Test Non-Production First** | Always validate CRUD operations on a dev/test instance before production |
+
+### Security configuration
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MAXIMO_ENABLE_WRITES` | `false` | Exposes `create_record`, `update_record` and `run_action`. When `false` they are hidden from the tool list and refused. |
+| `MAXIMO_ALLOWED_OBJECT_STRUCTURES` | *(any)* | Comma-separated allowlist (e.g. `MXWO,MXASSET`). |
+| `MAXIMO_ALLOWED_ACTIONS` | `changeStatus` | Actions `run_action` may execute. |
+| `MAXIMO_MAX_PAGE_SIZE` | `100` | Upper bound on records per query. |
+| `HOST` (demo proxy) | `127.0.0.1` | Interface the demo proxy binds to. |
+| `MAXIMO_PROXY_INSECURE_TLS` (demo proxy) | `false` | Disables TLS verification to Maximo. Test instances only. |
+
+Built-in protections:
+
+- **Input validation** — Object Structure names must match `^[A-Za-z][A-Za-z0-9_]*$`, which prevents path traversal to other Maximo endpoints. Record IDs, action names and `pageSize` are validated as well.
+- **Prompt-injection awareness** — Maximo records contain free text typed by end users. Query results carry a notice that the data is untrusted, and every tool declares MCP `readOnlyHint` / `destructiveHint` annotations, so clients can ask for confirmation before write calls.
+- **Escaped HTML** — `render_carbon_table` and `render_carbon_details` escape all record data and include a restrictive Content-Security-Policy. `query_maximo` returns JSON unless `formatted: true` is passed.
+- **Demo proxy** — binds to localhost, rejects non-localhost `Host` headers and cross-site requests, only forwards `GET /maximo/api/os/*` (writes need `MAXIMO_ENABLE_WRITES=true`), adds the API key server-side, verifies TLS, and serves only `demos/`, `images/` and `docs/`.
+- **Pin the version** — prefer `npx -y maximo-mcp-server@1.3.0` over an unpinned `npx` so a newly published version cannot run without review.
 
 ---
 
