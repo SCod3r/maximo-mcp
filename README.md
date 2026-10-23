@@ -79,11 +79,11 @@ All guides are also available in `.docx` format in the `docs/` folder for offlin
 
 ```bash
 # Clone the repository
-git clone https://github.com/markusvankempen/maximo-mcp-ai-integration-options.git
-cd maximo-mcp-ai-integration-options
+git clone https://github.com/SCod3r/maximo-mcp.git
+cd maximo-mcp
 
-# Install dependencies
-npm install
+# Install exactly the locked runtime dependencies, without dev tools or install scripts
+npm ci --omit=dev --ignore-scripts
 
 # Set up environment variables
 cp .env.example .env
@@ -171,8 +171,8 @@ If `curl` fails (e.g., due to SSL/network errors), you can manually download the
   "servers": {
     "maximo-mcp-server": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "maximo-mcp-server"],
+      "command": "node",
+      "args": ["/absolute/path/to/maximo-mcp/maximo-mcp-server.js"],
       "env": {
         "MAXIMO_URL": "${input:maximo-url}",
         "MAXIMO_API_KEY": "${input:maximo-api-key}",
@@ -200,8 +200,8 @@ If `curl` fails (e.g., due to SSL/network errors), you can manually download the
 {
   "mcpServers": {
     "maximo-mcp-server": {
-      "command": "npx",
-      "args": ["-y", "maximo-mcp-server"],
+      "command": "node",
+      "args": ["/absolute/path/to/maximo-mcp/maximo-mcp-server.js"],
       "env": {
         "MAXIMO_URL": "https://your-maximo-host/maximo/api",
         "MAXIMO_API_KEY": "your-api-key-here",
@@ -229,8 +229,8 @@ Edit with your Maximo credentials:
 {
   "mcpServers": {
     "maximo-mcp-server": {
-      "command": "npx",
-      "args": ["-y", "maximo-mcp-server"],
+      "command": "node",
+      "args": ["/absolute/path/to/maximo-mcp/maximo-mcp-server.js"],
       "env": {
         "MAXIMO_URL": "https://your-maximo-host/maximo/api",
         "MAXIMO_API_KEY": "your-api-key-here"
@@ -511,7 +511,7 @@ Maximo-MCP/
 
 ## Local deployment checklist
 
-1. **Run from a reviewed clone, not `npx`.** Install with `npm ci` (uses the lockfile exactly) and point your MCP client at `node /absolute/path/maximo-mcp-server.js`, as in `mcp.example.json`.
+1. **Run from a reviewed clone, not `npx`.** Install with `npm ci --omit=dev --ignore-scripts` (exact locked runtime dependencies, no install scripts) and point your MCP client at `node /absolute/path/maximo-mcp-server.js`, as in `mcp.example.json`. Delete any old `.smithery/` build folder from earlier clones.
 2. **Keep the key out of the client config.** Put `MAXIMO_API_KEY` in a `.env` file next to `maximo-mcp-server.js` (it is loaded from there whatever folder the client starts in) and restrict it: `chmod 600 .env`.
 3. **Use a dedicated integration user.** A Maximo API key acts with all the security groups of its user, and `oslc.where`/`oslc.select` let the model read anything that user can. Create the key for a user whose security group only grants read access to the Object Structures you need, and set `MAXIMO_ALLOWED_OBJECT_STRUCTURES` to match.
 4. **Start read-only, against a non-production instance.** Leave `MAXIMO_ENABLE_WRITES=false` until read-only use has been validated.
@@ -537,8 +537,12 @@ Optional tuning: `MAXIMO_TIMEOUT_MS` (default 30000) and `MAXIMO_MAX_OUTPUT_CHAR
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `MAXIMO_ENABLE_WRITES` | `false` | Exposes `create_record`, `update_record` and `run_action`. When `false` they are hidden from the tool list and refused. |
-| `MAXIMO_ALLOWED_OBJECT_STRUCTURES` | *(any)* | Comma-separated allowlist (e.g. `MXWO,MXASSET`). |
-| `MAXIMO_ALLOWED_ACTIONS` | `changeStatus` | Actions `run_action` may execute. |
+| `MAXIMO_ALLOWED_OBJECT_STRUCTURES` | `MXWO,MXASSET,MXSR,MXLOCATION,MXITEM,MXINVENTORY,MXDOMAIN` | Comma-separated allowlist. People/user structures (e.g. `MXPERSON`) must be added explicitly; `*` allows any. Applies to the MCP server and the demo proxy. |
+| `MAXIMO_ALLOW_RELATED_QUERIES` | `false` | Allows `rel.<relationship>` and nested `{…}` selects in where/select/orderBy, which can read objects outside the allowlist. |
+| `MAXIMO_ALLOWED_ACTIONS` | `changeStatus` | Actions `run_action` may execute. Set it empty to allow none. |
+| `MAXIMO_TIMEOUT_MS` | `30000` | Per-request timeout. |
+| `MAXIMO_MAX_OUTPUT_CHARS` | `100000` | Tool results above this size are truncated. |
+| `MAXIMO_ALLOW_INSECURE_HTTP` | `false` | Allows a plain-http `MAXIMO_URL` to a non-local host. Test instances only. |
 | `MAXIMO_MAX_PAGE_SIZE` | `100` | Upper bound on records per query. |
 | `HOST` (demo proxy) | `127.0.0.1` | Interface the demo proxy binds to. |
 | `MAXIMO_PROXY_INSECURE_TLS` (demo proxy) | `false` | Disables TLS verification to Maximo. Test instances only. |
@@ -548,7 +552,8 @@ Built-in protections:
 - **Input validation** — Object Structure names must match `^[A-Za-z][A-Za-z0-9_]*$`, which prevents path traversal to other Maximo endpoints. Record IDs, action names and `pageSize` are validated as well.
 - **Prompt-injection awareness** — Maximo records contain free text typed by end users. Query results carry a notice that the data is untrusted, and every tool declares MCP `readOnlyHint` / `destructiveHint` annotations, so clients can ask for confirmation before write calls.
 - **Escaped HTML** — `render_carbon_table` and `render_carbon_details` escape all record data and include a restrictive Content-Security-Policy. `query_maximo` returns JSON unless `formatted: true` is passed.
-- **Demo proxy** — binds to localhost, rejects non-localhost `Host` headers and cross-site requests, only forwards `GET /maximo/api/os/*` (writes need `MAXIMO_ENABLE_WRITES=true`), adds the API key server-side, verifies TLS, and serves only `demos/`, `images/` and `docs/`.
+- **Write payloads** — `recordData`/`actionData` may not contain Maximo control keys (`_action`, `_meta`, …) at any level, and `create_record` no longer uses the BULK method override.
+- **Demo proxy** — binds to localhost and rejects non-localhost `Host` headers. It requires a per-launch token: open the `?token=` URL printed at startup once, and the browser keeps it in an HttpOnly cookie. It rejects cross-site requests and forwards only allowlisted `GET /maximo/api/os/{name}` calls (writes need `MAXIMO_ENABLE_WRITES=true`). It passes on only a few safe request headers, adds the API key server-side, verifies TLS and does not relay redirects. It serves only `demos/`, `images/` and `docs/`, under a Content-Security-Policy that allows scripts from this origin only; third-party libraries are vendored in `demos/vendor/` with checksums in `SHA256SUMS`.
 - **Transport safety** — the API key is only ever sent to the `MAXIMO_URL` origin, over https (plain http is refused except for localhost or with `MAXIMO_ALLOW_INSECURE_HTTP=true`). Redirects are never followed, requests time out, and oversized results are truncated.
 - **Run a reviewed copy** — run the server from a reviewed clone rather than an unpinned `npx` install, so a newly published version cannot run without review.
 

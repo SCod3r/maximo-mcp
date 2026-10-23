@@ -67,13 +67,20 @@ describe('Object Structure validation (path traversal)', () => {
 
     test('accepts and upper-cases valid names', () => {
         expect(s.validateObjectStructure('mxwo')).toBe('MXWO');
-        expect(s.validateObjectStructure('MX_ASSET2')).toBe('MX_ASSET2');
+        const open = loadServer({ MAXIMO_ALLOWED_OBJECT_STRUCTURES: '*' });
+        expect(open.validateObjectStructure('MX_ASSET2')).toBe('MX_ASSET2');
+    });
+
+    test('default allowlist excludes people and user structures', () => {
+        expect(() => s.validateObjectStructure('MXPERSON')).toThrow(/not allowed/);
+        expect(() => s.validateObjectStructure('MXAPIUSER')).toThrow(/not allowed/);
+        expect(s.validateObjectStructure('mxasset')).toBe('MXASSET');
     });
 
     test('enforces the allowlist when configured', () => {
         const restricted = loadServer({ MAXIMO_ALLOWED_OBJECT_STRUCTURES: 'MXWO, mxasset' });
         expect(restricted.validateObjectStructure('mxasset')).toBe('MXASSET');
-        expect(() => restricted.validateObjectStructure('MXPERSON')).toThrow(/not in MAXIMO_ALLOWED_OBJECT_STRUCTURES/);
+        expect(() => restricted.validateObjectStructure('MXPERSON')).toThrow(/not allowed/);
     });
 
     test('query_maximo never builds a URL outside /os/{name}', async () => {
@@ -92,6 +99,44 @@ describe('Object Structure validation (path traversal)', () => {
         await expect(s.renderCarbonTable({ objectStructure: '../x' })).rejects.toThrow();
         await expect(s.renderCarbonDetails({ objectStructure: '../x', where: 'a=1' })).rejects.toThrow();
         expect(calls).toHaveLength(0);
+    });
+});
+
+describe('Data reach limits', () => {
+    test('blocks related-object clauses unless enabled', async () => {
+        const s = loadServer();
+        const calls = mockFetch();
+        for (const args of [
+            { where: 'rel.maxuser.status="ACTIVE"' },
+            { select: '*,rel.maxuser{*}' },
+            { select: 'wonum,woactivity{*}' },
+            { orderBy: '-rel.asset.assetnum' },
+        ]) {
+            await expect(s.queryMaximo({ objectStructure: 'MXWO', ...args })).rejects.toThrow(/related objects/);
+        }
+        await expect(s.renderCarbonDetails({ objectStructure: 'MXWO', where: 'rel.x.y=1' })).rejects.toThrow(/related objects/);
+        expect(calls).toHaveLength(0);
+        // ordinary clauses still work, including field names that contain "rel"
+        await s.queryMaximo({ objectStructure: 'MXWO', where: 'status="APPR" and parentrel="x"', select: 'wonum,description' });
+        expect(calls).toHaveLength(1);
+        const open = loadServer({ MAXIMO_ALLOW_RELATED_QUERIES: 'true' });
+        expect(() => open.validateQueryClauses({ select: 'rel.asset{*}' })).not.toThrow();
+    });
+
+    test('list_object_structures only lists allowed structures', async () => {
+        const s = loadServer({ MAXIMO_ALLOWED_OBJECT_STRUCTURES: 'MXWO' });
+        mockFetch({ member: [{ 'oslc:name': 'MXWO' }, { 'oslc:name': 'MXPERSON' }] });
+        const res = await s.listObjectStructures({});
+        const names = JSON.parse(res.content[0].text).map((r) => r.name);
+        expect(names).toEqual(['MXWO']);
+    });
+
+    test('inferred schema does not include record values', async () => {
+        const s = loadServer();
+        mockFetch({ member: [{ wonum: 'SECRET-VALUE', description: 'private text' }] });
+        const res = await s.getSchemaDetails({ objectStructure: 'MXWO' });
+        expect(res.content[0].text).not.toMatch(/SECRET-VALUE|private text/);
+        expect(res.content[0].text).toMatch(/wonum/);
     });
 });
 
@@ -159,6 +204,34 @@ describe('Write tools are read-only by default', () => {
         for (const id of ['..', '.', 'a/b', 'a?b', 'a b', '']) {
             await expect(s.updateRecord({ objectStructure: 'MXWO', recordId: id, recordData: {} })).rejects.toThrow();
         }
+    });
+
+    test('write payloads cannot carry Maximo control keys', async () => {
+        const s = loadServer({ MAXIMO_ENABLE_WRITES: 'true' });
+        const calls = mockFetch({});
+        await expect(
+            s.createRecord({ objectStructure: 'MXWO', recordData: { description: 'x', _meta: { method: 'DELETE' } } })
+        ).rejects.toThrow(/control keys/);
+        await expect(
+            s.updateRecord({ objectStructure: 'MXWO', recordId: 'A', recordData: { woactivity: [{ _action: 'Delete' }] } })
+        ).rejects.toThrow(/control keys/);
+        await expect(
+            s.runAction({ objectStructure: 'MXWO', recordId: 'A', action: 'changeStatus', actionData: { _action: 'x' } })
+        ).rejects.toThrow(/control keys/);
+        expect(calls).toHaveLength(0);
+    });
+
+    test('create_record does not use the BULK method override', async () => {
+        const s = loadServer({ MAXIMO_ENABLE_WRITES: 'true' });
+        const calls = mockFetch({});
+        await s.createRecord({ objectStructure: 'MXWO', recordData: { description: 'x', siteid: 'S' } });
+        const headers = Object.fromEntries(Object.entries(calls[0].opts.headers).map(([k, v]) => [k.toLowerCase(), v]));
+        expect(headers['x-method-override']).toBeUndefined();
+    });
+
+    test('an empty MAXIMO_ALLOWED_ACTIONS allows no actions', () => {
+        const s = loadServer({ MAXIMO_ALLOWED_ACTIONS: '' });
+        expect(() => s.validateAction('changeStatus')).toThrow(/not allowed/);
     });
 
     test('recordData must be a JSON object', async () => {
@@ -256,7 +329,7 @@ describe('Transport safety (maximoFetch)', () => {
     });
 
     test('does not follow redirects, so the API key never reaches the SSO host', async () => {
-        const s = loadServer({ MAXIMO_URL: urls.mx });
+        const s = loadServer({ MAXIMO_URL: urls.mx, MAXIMO_ALLOWED_OBJECT_STRUCTURES: '*' });
         const res = await s.queryMaximo({ objectStructure: 'MXREDIRECT' });
         expect(res.isError).toBe(true);
         expect(res.content[0].text).toMatch(/redirect/);
@@ -264,7 +337,7 @@ describe('Transport safety (maximoFetch)', () => {
     });
 
     test('reports an HTML login page clearly instead of a JSON parse error', async () => {
-        const s = loadServer({ MAXIMO_URL: urls.mx });
+        const s = loadServer({ MAXIMO_URL: urls.mx, MAXIMO_ALLOWED_OBJECT_STRUCTURES: '*' });
         const res = await s.queryMaximo({ objectStructure: 'MXLOGIN' });
         expect(res.isError).toBe(true);
         expect(res.content[0].text).toMatch(/HTML page/);
@@ -304,77 +377,142 @@ describe('Demo proxy (server.js)', () => {
     let upstream;
     let upstreamRequests;
     let app;
+    const TOKEN = 'test-token-123';
 
     beforeAll(async () => {
         upstreamRequests = [];
         upstream = http.createServer((req, res) => {
             upstreamRequests.push({ url: req.url, headers: req.headers, method: req.method });
+            if (req.url.includes('redirect')) {
+                res.statusCode = 302;
+                res.setHeader('Location', 'https://idp.example.com/login');
+                return res.end();
+            }
             res.setHeader('Content-Type', 'application/json');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('Set-Cookie', 'JSESSIONID=abc');
             res.end(JSON.stringify({ member: [] }));
         });
         await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
-        const saved = { ...process.env };
-        process.env.MAXIMO_HOST = `http://127.0.0.1:${upstream.address().port}`;
-        process.env.MAXIMO_API_KEY = 'server-side-key';
-        delete process.env.MAXIMO_ENABLE_WRITES;
         jest.isolateModules(() => {
-            app = require('./server.js').createApp();
+            app = require('./server.js').createApp({
+                token: TOKEN,
+                env: {
+                    MAXIMO_HOST: `http://127.0.0.1:${upstream.address().port}`,
+                    MAXIMO_API_KEY: 'server-side-key',
+                    MAXIMO_OPENAPI_PATH: '/nonexistent/openapi.json',
+                },
+            });
         });
-        process.env = saved;
     });
 
     afterAll(() => new Promise((r) => upstream.close(r)));
     beforeEach(() => (upstreamRequests.length = 0));
 
     const local = (req) => req.set('Host', 'localhost:3002');
+    const authed = (req) => local(req).set('Cookie', `maximo_proxy_token=${TOKEN}`);
 
-    test('proxies same-origin GETs to /maximo/api/os and injects the API key', async () => {
-        const res = await local(request(app).get('/maximo/api/os/mxwo?lean=1')).set('Cookie', 'x=y');
+    test('requires the per-launch token', async () => {
+        let res = await local(request(app).get('/maximo/api/os/mxwo'));
+        expect(res.status).toBe(401);
+        res = await local(request(app).get('/demos/index.html'));
+        expect(res.status).toBe(401);
+        res = await local(request(app).get('/demos/index.html')).set('Cookie', 'maximo_proxy_token=wrong');
+        expect(res.status).toBe(401);
+        expect(upstreamRequests).toHaveLength(0);
+    });
+
+    test('the token URL sets an HttpOnly SameSite=Strict cookie and strips the token', async () => {
+        const res = await local(request(app).get(`/demos/index.html?token=${TOKEN}`));
+        expect(res.status).toBe(303);
+        expect(res.headers.location).toBe('/demos/index.html');
+        expect(res.headers['set-cookie'][0]).toMatch(/HttpOnly/);
+        expect(res.headers['set-cookie'][0]).toMatch(/SameSite=Strict/);
+    });
+
+    test('proxies same-origin GETs, injects the API key and forwards only safe headers', async () => {
+        const res = await authed(request(app).get('/maximo/api/os/mxwo?lean=1'))
+            .set('X-Method-Override', 'DELETE')
+            .set('Properties', '*')
+            .set('Authorization', 'Basic eA==')
+            .set('X-Anything', '1');
         expect(res.status).toBe(200);
         expect(upstreamRequests).toHaveLength(1);
+        const h = upstreamRequests[0].headers;
         expect(upstreamRequests[0].url).toBe('/maximo/api/os/mxwo?lean=1');
-        expect(upstreamRequests[0].headers.apikey).toBe('server-side-key');
-        expect(upstreamRequests[0].headers.cookie).toBeUndefined();
+        expect(h.apikey).toBe('server-side-key');
+        for (const name of ['cookie', 'x-method-override', 'properties', 'authorization', 'x-anything']) {
+            expect(h[name]).toBeUndefined();
+        }
         expect(res.headers['access-control-allow-origin']).toBeUndefined();
         expect(res.headers['set-cookie']).toBeUndefined();
     });
 
+    test('does not pass Maximo/SSO redirects through to the browser', async () => {
+        const res = await authed(request(app).get('/maximo/api/os/mxwo?redirect=1'));
+        expect(res.status).toBe(502);
+        expect(res.headers.location).toBeUndefined();
+    });
+
     test('rejects non-localhost Host headers (DNS rebinding)', async () => {
-        const res = await request(app).get('/maximo/api/os/mxwo').set('Host', 'evil.example.com');
+        const res = await request(app)
+            .get('/maximo/api/os/mxwo')
+            .set('Host', 'evil.example.com')
+            .set('Cookie', `maximo_proxy_token=${TOKEN}`);
         expect(res.status).toBe(403);
         expect(upstreamRequests).toHaveLength(0);
     });
 
     test('rejects cross-site requests', async () => {
-        let res = await local(request(app).get('/maximo/api/os/mxwo')).set('Origin', 'https://evil.example.com');
+        let res = await authed(request(app).get('/maximo/api/os/mxwo')).set('Origin', 'https://evil.example.com');
         expect(res.status).toBe(403);
-        res = await local(request(app).get('/maximo/api/os/mxwo')).set('Sec-Fetch-Site', 'cross-site');
+        res = await authed(request(app).get('/maximo/api/os/mxwo')).set('Sec-Fetch-Site', 'cross-site');
         expect(res.status).toBe(403);
         expect(upstreamRequests).toHaveLength(0);
     });
 
-    test('only proxies Object Structure paths', async () => {
-        for (const p of ['/maximo/oslc/whoami', '/maximo/api/script/FOO', '/maximo/api/os/../script/FOO', '/maximo/api/os/%2e%2e/script']) {
-            const res = await local(request(app).get(p));
-            expect(res.status).toBe(403);
+    test('only proxies allowlisted Object Structure paths', async () => {
+        for (const p of [
+            '/maximo/oslc/whoami',
+            '/maximo/api/script/FOO',
+            '/maximo/api/os/../script/FOO',
+            '/maximo/api/os/%2e%2e/script',
+            '/maximo/api/os/%252e%252e/script',
+            '/maximo/api/os/mxwo/a/b',
+            '/maximo/api/os/mxapiuser?oslc.select=*',
+            '/maximo/api/os/mxperson',
+            '/maximo/api/os/mxwo?oslc.select=*,rel.maxuser{*}',
+            '/maximo/api/os/mxwo?oslc.where=rel.asset.status="X"',
+        ]) {
+            const res = await authed(request(app).get(p));
+            expect([400, 403]).toContain(res.status);
         }
         expect(upstreamRequests).toHaveLength(0);
+    });
+
+    test('rejects absolute-form request targets', async () => {
+        const { _internal } = require('./server.js');
+        const res = { status: jest.fn(() => res), send: jest.fn(() => res) };
+        const next = jest.fn();
+        _internal.requireCleanTarget({ originalUrl: 'http://evil.com/maximo/api/os/mxwo' }, res, next);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(next).not.toHaveBeenCalled();
     });
 
     test('blocks writes unless enabled', async () => {
-        const res = await local(request(app).post('/maximo/api/os/mxwo').send({}));
+        const res = await authed(request(app).post('/maximo/api/os/mxwo').send({}));
         expect(res.status).toBe(403);
         expect(upstreamRequests).toHaveLength(0);
     });
 
-    test('does not serve files from the project root', async () => {
-        for (const p of ['/package.json', '/.env', '/maximo-mcp-server.js', '/server.js']) {
-            const res = await local(request(app).get(p));
+    test('serves demos with a strict CSP and never the project root', async () => {
+        for (const p of ['/package.json', '/.env', '/maximo-mcp-server.js', '/server.js', '/security-config.js']) {
+            const res = await authed(request(app).get(p));
             expect(res.status).toBe(404);
         }
-        const demo = await local(request(app).get('/demos/index.html'));
+        const demo = await authed(request(app).get('/demos/index.html'));
         expect(demo.status).toBe(200);
+        expect(demo.headers['content-security-policy']).toMatch(/script-src 'self' 'unsafe-inline'(;|$)/);
+        expect(demo.text).not.toMatch(/<script[^>]+src="https?:/);
     });
 });

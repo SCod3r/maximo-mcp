@@ -165,34 +165,12 @@ function capToolOutput(result) {
 
 // --- Security configuration ---
 
-/** Parse a comma-separated env var into an upper/lower-cased Set (empty Set = not configured). */
-function parseList(value, toCase = (s) => s.toUpperCase()) {
-    return new Set(
-        String(value || '')
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .map(toCase)
-    );
-}
-
-function parseBool(value, defaultValue = false) {
-    if (value === undefined || value === null || value === '') return defaultValue;
-    return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
-}
-
-function loadSecurityConfig(env = process.env) {
-    const maxPageSize = parseInt(env.MAXIMO_MAX_PAGE_SIZE, 10);
-    return {
-        // Write tools (create_record, update_record, run_action) are disabled unless explicitly enabled.
-        writesEnabled: parseBool(env.MAXIMO_ENABLE_WRITES, false),
-        // Optional allowlist of Object Structures the server may touch (e.g. "MXWO,MXASSET"). Empty = any valid name.
-        allowedObjectStructures: parseList(env.MAXIMO_ALLOWED_OBJECT_STRUCTURES),
-        // Allowlist of actions run_action may execute. Defaults to changeStatus only.
-        allowedActions: parseList(env.MAXIMO_ALLOWED_ACTIONS || 'changeStatus', (s) => s.toLowerCase()),
-        maxPageSize: Number.isFinite(maxPageSize) && maxPageSize > 0 ? maxPageSize : 100,
-    };
-}
+const {
+    loadSecurityConfig,
+    validateObjectStructure: validateObjectStructureWith,
+    isObjectStructureAllowed: isObjectStructureAllowedWith,
+    validateQueryClauses: validateQueryClausesWith,
+} = require('./security-config');
 
 const SECURITY = loadSecurityConfig();
 
@@ -204,25 +182,23 @@ if (SECURITY.writesEnabled) {
     console.error('Write tools are disabled (read-only mode). Set MAXIMO_ENABLE_WRITES=true to enable them.');
 }
 
-// Object Structure names are alphanumeric/underscore only. This prevents path traversal
-// (e.g. "../../oslc/...") and query-string injection into the request URL.
-const OBJECT_STRUCTURE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const validateObjectStructure = (objectStructure, security = SECURITY) => validateObjectStructureWith(objectStructure, security);
+const isObjectStructureAllowed = (name, security = SECURITY) => isObjectStructureAllowedWith(name, security);
+const validateQueryClauses = (clauses, security = SECURITY) => validateQueryClausesWith(clauses, security);
 
-/**
- * Validate an Object Structure name and return it upper-cased.
- * Throws if the name is malformed or not on the configured allowlist.
- */
-function validateObjectStructure(objectStructure, security = SECURITY) {
-    if (typeof objectStructure !== 'string' || !OBJECT_STRUCTURE_PATTERN.test(objectStructure)) {
-        throw new Error(
-            'Invalid objectStructure: must be an Object Structure name containing only letters, digits and underscores (e.g. MXWO).'
-        );
+/** Reject Maximo control keys (_action, _meta, …) anywhere in a write payload. */
+function assertNoControlKeys(value, name, depth = 0) {
+    if (depth > 20) throw new Error(`${name} is nested too deeply.`);
+    if (Array.isArray(value)) {
+        value.forEach((v) => assertNoControlKeys(v, name, depth + 1));
+    } else if (value && typeof value === 'object') {
+        for (const [k, v] of Object.entries(value)) {
+            if (k.startsWith('_')) {
+                throw new Error(`${name} may not contain Maximo control keys such as "${k}".`);
+            }
+            assertNoControlKeys(v, name, depth + 1);
+        }
     }
-    const osName = objectStructure.toUpperCase();
-    if (security.allowedObjectStructures.size > 0 && !security.allowedObjectStructures.has(osName)) {
-        throw new Error(`Object Structure ${osName} is not in MAXIMO_ALLOWED_OBJECT_STRUCTURES.`);
-    }
-    return osName;
 }
 
 /** Validate a run_action action name against the allowlist. */
@@ -408,7 +384,7 @@ loadLocalSchema();
 const server = new Server(
     {
         name: "maximo-mcp-server",
-        version: "1.3.0",
+        version: "1.4.0",
     },
     {
         capabilities: {
@@ -455,6 +431,7 @@ async function listObjectStructures({ filter }) {
     }
 
     results = results
+        .filter(item => isObjectStructureAllowed(item.name))
         .filter(item => !filter || item.name.toLowerCase().includes(filter.toLowerCase()) || (item.description || '').toLowerCase().includes(filter.toLowerCase()))
         .slice(0, 50);
 
@@ -519,8 +496,7 @@ async function getSchemaDetails({ objectStructure }) {
                     name: propName,
                     type: typeof propVal === 'number' ? 'number' : typeof propVal === 'boolean' ? 'boolean' : Array.isArray(propVal) ? 'array' : 'string',
                     title: propName,
-                    description: '',
-                    sample: typeof propVal === 'object' ? undefined : propVal
+                    description: ''
                 }))
         };
         return {
@@ -540,6 +516,7 @@ async function queryMaximo({ objectStructure, where, select, orderBy, pageSize =
     where = validateOptionalString(where, 'where');
     select = validateOptionalString(select, 'select');
     orderBy = validateOptionalString(orderBy, 'orderBy', 200);
+    validateQueryClauses({ where, select, orderBy });
     pageSize = clampPageSize(pageSize);
 
     const params = new URLSearchParams({
@@ -658,6 +635,7 @@ async function renderCarbonTable({ objectStructure, where, select, orderBy, page
     where = validateOptionalString(where, 'where');
     select = validateOptionalString(select, 'select');
     orderBy = validateOptionalString(orderBy, 'orderBy', 200);
+    validateQueryClauses({ where, select, orderBy });
     title = validateOptionalString(title, 'title', 200) || 'Maximo Data';
     pageSize = clampPageSize(pageSize);
 
@@ -796,6 +774,7 @@ async function renderCarbonTable({ objectStructure, where, select, orderBy, page
 async function renderCarbonDetails({ objectStructure, where }) {
     const osName = validateObjectStructure(objectStructure);
     where = validateOptionalString(where, 'where');
+    validateQueryClauses({ where });
     const params = new URLSearchParams({ "lean": "1", "oslc.pageSize": "1" });
     if (where) params.append("oslc.where", where);
     const url = `${MAXIMO_URL}/os/${osName}?${params.toString()}`;
@@ -1019,6 +998,7 @@ async function createRecord({ objectStructure, recordData }) {
     const osName = validateObjectStructure(objectStructure);
     const url = `${MAXIMO_URL}/os/${osName}?lean=1`;
     const payload = parseJsonObject(recordData, 'recordData');
+    assertNoControlKeys(payload, 'recordData');
 
     const warnings = SmartValidator.validateCreate({ objectStructure: osName, recordData: payload });
 
@@ -1031,7 +1011,6 @@ async function createRecord({ objectStructure, recordData }) {
             headers: {
                 'apikey': API_KEY,
                 'Content-Type': 'application/json',
-                'x-method-override': 'BULK',
                 'Properties': '*'
             },
             body: JSON.stringify(payload)
@@ -1084,6 +1063,7 @@ async function updateRecord({ objectStructure, recordId, recordData }) {
     const id = validateRecordId(recordId);
     const url = `${MAXIMO_URL}/os/${osName}/${encodeURIComponent(id)}?lean=1`;
     const payload = parseJsonObject(recordData, 'recordData');
+    assertNoControlKeys(payload, 'recordData');
 
     console.error(`Updating ${osName} record ${id} (fields: ${Object.keys(payload).join(', ')})`);
 
@@ -1145,6 +1125,7 @@ async function runAction({ objectStructure, recordId, action, actionData }) {
     const url = `${MAXIMO_URL}/os/${osName}/${encodeURIComponent(id)}?action=${encodeURIComponent(action)}&lean=1`;
 
     const payload = actionData ? parseJsonObject(actionData, 'actionData') : {};
+    assertNoControlKeys(payload, 'actionData');
 
     const warnings = SmartValidator.validateAction({ objectStructure: osName, recordId, action, actionData: payload });
 
@@ -1465,6 +1446,10 @@ module.exports = {
         capToolOutput,
         validateObjectStructure,
         validateAction,
+        validateQueryClauses,
+        assertNoControlKeys,
+        listObjectStructures,
+        getSchemaDetails,
         validateRecordId,
         validateOptionalString,
         clampPageSize,
