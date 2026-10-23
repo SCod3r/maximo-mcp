@@ -67,21 +67,15 @@ All guides are also available in `.docx` format in the `docs/` folder for offlin
 
 ### Prerequisites
 
-- **Node.js** v18 or higher
+- **Node.js** v20 or higher (v22 LTS recommended)
 - **Maximo API Key** with read access
 - AI IDE with MCP support (Antigravity, Cursor, VS Code + Continue)
 
 ### Installation
 
-### Installation
+> ⚠️ The `maximo-mcp-server` package on npm is the upstream release without the security fixes in this fork. Run it from a clone of this repository instead of `npx`; see [Local deployment checklist](#local-deployment-checklist).
 
-**Method 1: Run directly with npx (Recommended)**
-
-```bash
-npx maximo-mcp-server
-```
-
-**Method 2: Clone from Source**
+**Clone from Source**
 
 ```bash
 # Clone the repository
@@ -515,6 +509,18 @@ Maximo-MCP/
 
 ---
 
+## Local deployment checklist
+
+1. **Run from a reviewed clone, not `npx`.** Install with `npm ci` (uses the lockfile exactly) and point your MCP client at `node /absolute/path/maximo-mcp-server.js`, as in `mcp.example.json`.
+2. **Keep the key out of the client config.** Put `MAXIMO_API_KEY` in a `.env` file next to `maximo-mcp-server.js` (it is loaded from there whatever folder the client starts in) and restrict it: `chmod 600 .env`.
+3. **Use a dedicated integration user.** A Maximo API key acts with all the security groups of its user, and `oslc.where`/`oslc.select` let the model read anything that user can. Create the key for a user whose security group only grants read access to the Object Structures you need, and set `MAXIMO_ALLOWED_OBJECT_STRUCTURES` to match.
+4. **Start read-only, against a non-production instance.** Leave `MAXIMO_ENABLE_WRITES=false` until read-only use has been validated.
+5. **Check where the data goes.** Everything a tool returns is sent to the model behind your MCP client. Make sure that client uses an LLM endpoint approved for this data.
+6. **Internal certificates.** If Maximo uses a certificate from an internal CA, set `NODE_EXTRA_CA_CERTS=/path/to/ca-bundle.pem`. Do not disable TLS verification.
+7. **SSO / zero-trust gateways.** This server authenticates only with the `apikey` header. If Maximo sits behind an OIDC/SAML or zero-trust gateway, requests come back as redirects or login pages. The server reports this clearly and does not follow the redirect (so the key is never sent to the identity provider). You need an API route that accepts API keys directly.
+
+Optional tuning: `MAXIMO_TIMEOUT_MS` (default 30000) and `MAXIMO_MAX_OUTPUT_CHARS` (default 100000).
+
 ## 🔒 Security Best Practices
 
 | Practice | Description |
@@ -543,7 +549,8 @@ Built-in protections:
 - **Prompt-injection awareness** — Maximo records contain free text typed by end users. Query results carry a notice that the data is untrusted, and every tool declares MCP `readOnlyHint` / `destructiveHint` annotations, so clients can ask for confirmation before write calls.
 - **Escaped HTML** — `render_carbon_table` and `render_carbon_details` escape all record data and include a restrictive Content-Security-Policy. `query_maximo` returns JSON unless `formatted: true` is passed.
 - **Demo proxy** — binds to localhost, rejects non-localhost `Host` headers and cross-site requests, only forwards `GET /maximo/api/os/*` (writes need `MAXIMO_ENABLE_WRITES=true`), adds the API key server-side, verifies TLS, and serves only `demos/`, `images/` and `docs/`.
-- **Pin the version** — prefer `npx -y maximo-mcp-server@1.3.0` over an unpinned `npx` so a newly published version cannot run without review.
+- **Transport safety** — the API key is only ever sent to the `MAXIMO_URL` origin, over https (plain http is refused except for localhost or with `MAXIMO_ALLOW_INSECURE_HTTP=true`). Redirects are never followed, requests time out, and oversized results are truncated.
+- **Run a reviewed copy** — run the server from a reviewed clone rather than an unpinned `npx` install, so a newly published version cannot run without review.
 
 ---
 

@@ -16,7 +16,7 @@
  *  - Verifies Maximo's TLS certificate unless MAXIMO_PROXY_INSECURE_TLS=true.
  *  - Serves only the demos/, images/ and docs/ folders — never the project root.
  */
-require('dotenv').config({ quiet: true });
+require('dotenv').config({ quiet: true, path: require('path').join(__dirname, '.env') });
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');

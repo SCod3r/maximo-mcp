@@ -59,6 +59,9 @@
     "url": "https://github.com/markusvankempen/maximo-mcp-ai-integration-options/issues"
   },
   "homepage": "https://github.com/markusvankempen/maximo-mcp-ai-integration-options#readme",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "dotenv": "^18.0.9",

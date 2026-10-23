@@ -4,6 +4,8 @@
 const http = require('http');
 const request = require('supertest');
 
+const realFetch = global.fetch;
+
 // Silence server logging (installed before describe blocks load modules).
 jest.spyOn(console, 'error').mockImplementation(() => {});
 jest.spyOn(console, 'warn').mockImplementation(() => {});
@@ -37,6 +39,7 @@ function mockFetch(body = { member: [] }, status = 200) {
             ok: status >= 200 && status < 300,
             status,
             statusText: 'OK',
+            headers: new Headers({ 'content-type': 'application/json' }),
             json: async () => body,
             text: async () => JSON.stringify(body),
         };
@@ -200,6 +203,100 @@ describe('HTML escaping in render tools (XSS)', () => {
         const parsed = JSON.parse(res.content[0].text);
         expect(parsed.records).toHaveLength(1);
         expect(parsed.notice).toMatch(/untrusted/i);
+    });
+});
+
+describe('Transport safety (maximoFetch)', () => {
+    let mx;
+    let idp;
+    let hang;
+    let seen;
+    let urls;
+
+    beforeAll(async () => {
+        global.fetch = realFetch;
+        seen = [];
+        idp = http.createServer((req, res) => {
+            seen.push({ host: 'idp', apikey: req.headers.apikey });
+            res.setHeader('content-type', 'text/html');
+            res.end('<html>Sign in</html>');
+        });
+        hang = http.createServer(() => {});
+        await new Promise((r) => idp.listen(0, '127.0.0.1', r));
+        await new Promise((r) => hang.listen(0, '127.0.0.1', r));
+        mx = http.createServer((req, res) => {
+            seen.push({ host: 'maximo', apikey: req.headers.apikey, url: req.url });
+            if (req.url.includes('/os/MXREDIRECT')) {
+                res.statusCode = 302;
+                res.setHeader('location', `http://localhost:${idp.address().port}/authorize`);
+                return res.end();
+            }
+            if (req.url.includes('/os/MXLOGIN')) {
+                res.setHeader('content-type', 'text/html; charset=utf-8');
+                return res.end('<html>Sign in</html>');
+            }
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ member: [{ wonum: '1', description: 'x'.repeat(5000) }] }));
+        });
+        await new Promise((r) => mx.listen(0, '127.0.0.1', r));
+        urls = {
+            mx: `http://127.0.0.1:${mx.address().port}/maximo/api`,
+            hang: `http://127.0.0.1:${hang.address().port}/maximo/api`,
+        };
+    });
+
+    afterAll(async () => {
+        global.fetch = realFetch;
+        await Promise.all([mx, idp, hang].map((srv) => new Promise((r) => { srv.closeAllConnections?.(); srv.close(r); })));
+    });
+
+    beforeEach(() => {
+        global.fetch = realFetch;
+        seen.length = 0;
+    });
+
+    test('does not follow redirects, so the API key never reaches the SSO host', async () => {
+        const s = loadServer({ MAXIMO_URL: urls.mx });
+        const res = await s.queryMaximo({ objectStructure: 'MXREDIRECT' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toMatch(/redirect/);
+        expect(seen.filter((r) => r.host === 'idp')).toHaveLength(0);
+    });
+
+    test('reports an HTML login page clearly instead of a JSON parse error', async () => {
+        const s = loadServer({ MAXIMO_URL: urls.mx });
+        const res = await s.queryMaximo({ objectStructure: 'MXLOGIN' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toMatch(/HTML page/);
+    });
+
+    test('times out instead of hanging', async () => {
+        const s = loadServer({ MAXIMO_URL: urls.hang, MAXIMO_TIMEOUT_MS: '300' });
+        const started = Date.now();
+        const res = await s.queryMaximo({ objectStructure: 'MXWO' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toMatch(/did not respond/);
+        expect(Date.now() - started).toBeLessThan(5000);
+    });
+
+    test('refuses plain http to a non-local host', async () => {
+        const s = loadServer({ MAXIMO_URL: 'http://maximo.example.com/maximo/api' });
+        const res = await s.queryMaximo({ objectStructure: 'MXWO' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toMatch(/unencrypted/);
+        expect(s.resolveMaximoOrigin('http://maximo.example.com/maximo', { MAXIMO_ALLOW_INSECURE_HTTP: 'true' }).error).toBeNull();
+    });
+
+    test('never sends the API key to another origin', async () => {
+        const s = loadServer({ MAXIMO_URL: urls.mx });
+        await expect(s.maximoFetch('https://evil.example.com/maximo/api/os/MXWO', {})).rejects.toThrow(/other than MAXIMO_URL/);
+    });
+
+    test('caps oversized tool output', () => {
+        const s = loadServer({ MAXIMO_MAX_OUTPUT_CHARS: '1000' });
+        const out = s.capToolOutput({ content: [{ type: 'text', text: 'y'.repeat(5000) }] });
+        expect(out.content[0].text.length).toBeLessThan(1300);
+        expect(out.content[0].text).toMatch(/truncated/);
     });
 });
 

@@ -14,7 +14,9 @@
 
 // Load environment variables from .env file
 // IMPORTANT: quiet:true prevents dotenv from outputting to stdout, which would corrupt MCP stdio
-require('dotenv').config({ quiet: true });
+// Load .env from this file's folder (MCP clients start the server from arbitrary working directories).
+// Values already set in the environment (e.g. by the MCP client config) take precedence.
+require('dotenv').config({ quiet: true, path: require('path').join(__dirname, '.env') });
 
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -56,6 +58,109 @@ if (!RAW_MAXIMO_URL || !API_KEY) {
 
 if (RAW_MAXIMO_URL && RAW_MAXIMO_URL !== MAXIMO_URL) {
     console.error(`URL normalized: ${RAW_MAXIMO_URL} → ${MAXIMO_URL}`);
+}
+
+// --- Transport safety: every request to Maximo goes through maximoFetch() ---
+
+const REQUEST_TIMEOUT_MS = (() => {
+    const n = parseInt(process.env.MAXIMO_TIMEOUT_MS, 10);
+    return Number.isFinite(n) && n > 0 ? n : 30000;
+})();
+
+/**
+ * Work out which origin the API key may be sent to. Returns { origin, error }.
+ * Plain http is refused (the key would travel in clear text) unless the host is local
+ * or MAXIMO_ALLOW_INSECURE_HTTP=true.
+ */
+function resolveMaximoOrigin(maximoUrl, env = process.env) {
+    if (!maximoUrl) return { origin: null, error: 'MAXIMO_URL is not set.' };
+    let u;
+    try {
+        u = new URL(maximoUrl);
+    } catch {
+        return { origin: null, error: `MAXIMO_URL is not a valid URL.` };
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+        return { origin: null, error: 'MAXIMO_URL must use https.' };
+    }
+    const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+    const allowHttp = /^(1|true|yes|on)$/i.test(env.MAXIMO_ALLOW_INSECURE_HTTP || '');
+    if (u.protocol === 'http:' && !isLocal && !allowHttp) {
+        return {
+            origin: null,
+            error: 'MAXIMO_URL uses plain http, which would send the API key unencrypted. Use https (or set MAXIMO_ALLOW_INSECURE_HTTP=true for a test instance).',
+        };
+    }
+    return { origin: u.origin, error: null };
+}
+
+const { origin: MAXIMO_ORIGIN, error: MAXIMO_CONFIG_ERROR } = resolveMaximoOrigin(MAXIMO_URL);
+if (MAXIMO_CONFIG_ERROR && RAW_MAXIMO_URL) console.error(`ERROR: ${MAXIMO_CONFIG_ERROR}`);
+
+function authGatewayHint(what) {
+    return (
+        `Maximo returned ${what} instead of API data. This usually means the request was intercepted by a ` +
+        `single sign-on (OIDC/SAML) or zero-trust gateway that does not accept the Maximo API key. ` +
+        `The redirect was not followed, so the API key was not sent anywhere else. Ask your Maximo administrator for an ` +
+        `API endpoint that accepts API keys directly (bypassing the browser SSO path).`
+    );
+}
+
+/**
+ * fetch() wrapper for all Maximo calls:
+ *  - only ever sends the API key to the configured MAXIMO_URL origin;
+ *  - never follows redirects (Node's fetch would otherwise forward the custom `apikey`
+ *    header to whatever host a redirect points at, e.g. an SSO identity provider);
+ *  - times out instead of hanging the MCP tool call forever;
+ *  - turns HTML login pages into a clear error instead of a JSON parse failure.
+ */
+async function maximoFetch(url, init = {}) {
+    if (MAXIMO_CONFIG_ERROR) throw new Error(MAXIMO_CONFIG_ERROR);
+    const target = new URL(url);
+    if (target.origin !== MAXIMO_ORIGIN) {
+        throw new Error('Refusing to send the API key to a host other than MAXIMO_URL.');
+    }
+    let res;
+    try {
+        res = await fetch(target, { ...init, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    } catch (e) {
+        if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+            throw new Error(`Maximo did not respond within ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s (MAXIMO_TIMEOUT_MS).`);
+        }
+        const cause = e && e.cause && (e.cause.code || e.cause.message);
+        if (cause && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(String(cause))) {
+            throw new Error(
+                `TLS certificate verification failed (${cause}). If Maximo uses an internal CA, point NODE_EXTRA_CA_CERTS at the CA bundle — do not disable verification.`
+            );
+        }
+        throw new Error(`Could not reach Maximo${cause ? ` (${cause})` : ''}.`);
+    }
+    if (res.status >= 300 && res.status < 400) {
+        throw new Error(authGatewayHint(`an HTTP ${res.status} redirect`));
+    }
+    const contentType = res.headers.get('content-type') || '';
+    if (/text\/html/i.test(contentType)) {
+        throw new Error(authGatewayHint(`an HTML page (HTTP ${res.status})`));
+    }
+    return res;
+}
+
+// Cap on the size of any single tool result, so a wide query cannot flood the model's context.
+const MAX_OUTPUT_CHARS = (() => {
+    const n = parseInt(process.env.MAXIMO_MAX_OUTPUT_CHARS, 10);
+    return Number.isFinite(n) && n > 0 ? n : 100000;
+})();
+
+function capToolOutput(result) {
+    if (!result || !Array.isArray(result.content)) return result;
+    for (const item of result.content) {
+        if (item && typeof item.text === 'string' && item.text.length > MAX_OUTPUT_CHARS) {
+            item.text =
+                item.text.slice(0, MAX_OUTPUT_CHARS) +
+                `\n\n[Output truncated at ${MAX_OUTPUT_CHARS} characters. Narrow the query with oslc.select, a tighter where clause, or a smaller pageSize.]`;
+        }
+    }
+    return result;
 }
 
 // --- Security configuration ---
@@ -213,8 +318,12 @@ function loadLocalSchema() {
     return false;
 }
 
+let lastSchemaFetchFailure = 0;
+const SCHEMA_RETRY_MS = 5 * 60 * 1000;
+
 async function fetchLiveSchema() {
     if (!MAXIMO_URL || !API_KEY) return false;
+    if (Date.now() - lastSchemaFetchFailure < SCHEMA_RETRY_MS) return false;
     // Maximo exposes its OpenAPI spec at /oas/api.json (relative to /api base)
     // e.g. https://host/maximo/api  →  /oas/api.json  →  https://host/maximo/oas/api.json
     // Or the OSLC variant:  https://host/maximo/oslc/oas/api
@@ -227,7 +336,7 @@ async function fetchLiveSchema() {
     for (const oasUrl of oasUrls) {
         try {
             console.error(`Fetching OpenAPI spec from ${oasUrl}...`);
-            const res = await fetch(oasUrl, {
+            const res = await maximoFetch(oasUrl, {
                 headers: {
                     'apikey': API_KEY,
                     'Accept': 'application/json'
@@ -246,6 +355,7 @@ async function fetchLiveSchema() {
             console.error(`  → Failed: ${e.message}`);
         }
     }
+    lastSchemaFetchFailure = Date.now();
     return false;
 }
 
@@ -255,7 +365,7 @@ async function discoverObjectStructures() {
     try {
         const url = `${MAXIMO_URL}/os?lean=1&oslc.pageSize=200`;
         console.error(`Discovering Object Structures from ${url}...`);
-        const res = await fetch(url, {
+        const res = await maximoFetch(url, {
             headers: { 'apikey': API_KEY, 'Accept': 'application/json' }
         });
         if (!res.ok) return [];
@@ -389,7 +499,7 @@ async function getSchemaDetails({ objectStructure }) {
     console.error(`Schema RESOURCE_${osName} not found in OpenAPI spec, inferring from live data...`);
     try {
         const url = `${MAXIMO_URL}/os/${osName}?lean=1&oslc.pageSize=1`;
-        const res = await fetch(url, {
+        const res = await maximoFetch(url, {
             headers: { 'apikey': API_KEY, 'Content-Type': 'application/json' }
         });
         if (!res.ok) {
@@ -446,7 +556,7 @@ async function queryMaximo({ objectStructure, where, select, orderBy, pageSize =
     console.error(`Querying ${osName} (pageSize=${pageSize})`);
 
     try {
-        const response = await fetch(url, {
+        const response = await maximoFetch(url, {
             headers: {
                 "apikey": API_KEY,
                 "Content-Type": "application/json"
@@ -498,7 +608,7 @@ async function queryMaximo({ objectStructure, where, select, orderBy, pageSize =
 
     } catch (error) {
         return {
-            content: [{ type: "text", text: `Network Error: ${error.message}` }],
+            content: [{ type: "text", text: `Error: ${error.message}` }],
             isError: true
         };
     }
@@ -562,7 +672,7 @@ async function renderCarbonTable({ objectStructure, where, select, orderBy, page
         if (orderBy) params.append("oslc.orderBy", orderBy);
         const url = `${MAXIMO_URL}/os/${osName}?${params.toString()}`;
         try {
-            const res = await fetch(url, { headers: { "apikey": API_KEY, "Content-Type": "application/json" } });
+            const res = await maximoFetch(url, { headers: { "apikey": API_KEY, "Content-Type": "application/json" } });
             if (!res.ok) return { isError: true, content: [{ type: "text", text: `Error ${res.status}` }] };
             const data = await res.json();
             return { content: [{ text: JSON.stringify({ records: data.member, totalCount: data.responseInfo?.totalCount }) }] };
@@ -692,7 +802,7 @@ async function renderCarbonDetails({ objectStructure, where }) {
 
     let rec;
     try {
-        const res = await fetch(url, { headers: { "apikey": API_KEY, "Content-Type": "application/json" } });
+        const res = await maximoFetch(url, { headers: { "apikey": API_KEY, "Content-Type": "application/json" } });
         if (!res.ok) return { isError: true, content: [{ type: "text", text: `Error ${res.status}` }] };
         const data = await res.json();
         if (!data.member || data.member.length === 0) return { content: [{ type: "text", text: "Record not found" }] };
@@ -916,7 +1026,7 @@ async function createRecord({ objectStructure, recordData }) {
     console.error(`Creating record in ${osName} (fields: ${Object.keys(payload).join(', ')})`);
 
     try {
-        const response = await fetch(url, {
+        const response = await maximoFetch(url, {
             method: 'POST',
             headers: {
                 'apikey': API_KEY,
@@ -953,7 +1063,7 @@ async function createRecord({ objectStructure, recordData }) {
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 
     } catch (error) {
-        return { content: [{ type: "text", text: `Network Error: ${error.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
 }
 
@@ -978,7 +1088,7 @@ async function updateRecord({ objectStructure, recordId, recordData }) {
     console.error(`Updating ${osName} record ${id} (fields: ${Object.keys(payload).join(', ')})`);
 
     try {
-        const response = await fetch(url, {
+        const response = await maximoFetch(url, {
             method: 'POST',
             headers: {
                 'apikey': API_KEY,
@@ -1012,7 +1122,7 @@ async function updateRecord({ objectStructure, recordId, recordData }) {
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 
     } catch (error) {
-        return { content: [{ type: "text", text: `Network Error: ${error.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
 }
 
@@ -1041,7 +1151,7 @@ async function runAction({ objectStructure, recordId, action, actionData }) {
     console.error(`Running action ${action} on ${osName}/${id}`);
 
     try {
-        const response = await fetch(url, {
+        const response = await maximoFetch(url, {
             method: 'POST',
             headers: {
                 'apikey': API_KEY,
@@ -1075,7 +1185,7 @@ async function runAction({ objectStructure, recordId, action, actionData }) {
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 
     } catch (error) {
-        return { content: [{ type: "text", text: `Network Error: ${error.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
 }
 
@@ -1297,23 +1407,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         switch (name) {
             case "list_object_structures":
-                return await listObjectStructures(args);
+                return capToolOutput(await listObjectStructures(args));
             case "get_schema_details":
-                return await getSchemaDetails(args);
+                return capToolOutput(await getSchemaDetails(args));
             case "query_maximo":
-                return await queryMaximo(args);
+                return capToolOutput(await queryMaximo(args));
             case "render_carbon_table":
-                return await renderCarbonTable(args);
+                return capToolOutput(await renderCarbonTable(args));
             case "render_carbon_details":
-                return await renderCarbonDetails(args);
+                return capToolOutput(await renderCarbonDetails(args));
             case "get_instance_details":
-                return await getInstanceDetails();
+                return capToolOutput(await getInstanceDetails());
             case "create_record":
-                return await createRecord(args);
+                return capToolOutput(await createRecord(args));
             case "update_record":
-                return await updateRecord(args);
+                return capToolOutput(await updateRecord(args));
             case "run_action":
-                return await runAction(args);
+                return capToolOutput(await runAction(args));
             default:
                 throw new Error(`Unknown tool: ${name}`);
         }
@@ -1350,6 +1460,9 @@ module.exports = {
     // Exported for unit tests
     _internal: {
         loadSecurityConfig,
+        resolveMaximoOrigin,
+        maximoFetch,
+        capToolOutput,
         validateObjectStructure,
         validateAction,
         validateRecordId,
